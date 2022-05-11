@@ -12,6 +12,9 @@
 #include <linux/if_tun.h>
 #include <sys/ioctl.h>
 
+#include <stdlib.h>
+
+
 #define PORT_NUMBER 55555 // 服务器打开端口 
 #define BUFF_SIZE 2000   // 缓冲区大小
 
@@ -23,7 +26,7 @@ struct sockaddr_in server_addr;
 
 /* Make these what you want for cert & key files */
 #define CERTF	HOME"client.crt"
-#define KEYF	HOME"client.key"
+#define KEYF	HOME"client.key.unsecure"
 #define CACERT	HOME"ca.crt"
 
 #define CHK_NULL(x)	if ((x)==NULL) exit (1)
@@ -143,146 +146,6 @@ int setupTCPClient(const char *hostname, int port) // 输入客户端地址和�
 
 	return sockfd;
 }
-
-/*
-连接UDP 服务器
-返回 socket 文件描述符
-*/
-int connectToUDPServer(const char *svrip)
-{
-	int sockfd;
-	char *hello = "Hello";
-
-	memset(&peerAddr, 0, sizeof(peerAddr));
-	peerAddr.sin_family = AF_INET;
-	peerAddr.sin_port = htons(PORT_NUMBER);
-	peerAddr.sin_addr.s_addr = inet_addr(svrip);
-
-	sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (sockfd == -1) {
-		printf("Create socket failed! (%d: %s)\n", errno, strerror(errno));
-		return -1;
-	}
-	// Send a hello message to "connect" with the VPN server
-	sendto(sockfd, hello, strlen(hello), 0, (struct sockaddr *) &peerAddr, sizeof(peerAddr));
-
-	printf("Connect to server %s: %s\n", inet_ntoa(peerAddr.sin_addr), hello);
-	return sockfd;
-}
-
-
-/*
-从tun 中 读出 数据，传入 socket
-*/
-void tunSelected(int tunfd, int sockfd)
-{
-	int len;
-	char buff[BUFF_SIZE];
-
-	printf("Got a packet from TUN\n");
-
-	bzero(buff, BUFF_SIZE);
-	len = read(tunfd, buff, BUFF_SIZE);
-	sendto(sockfd, buff, len, 0, (struct sockaddr *) &peerAddr, sizeof(peerAddr));
-}
-
-/*
-从socket 中 读出 数据，传入 tun
-*/
-void socketSelected(int tunfd, int sockfd)
-{
-	int len;
-	char buff[BUFF_SIZE];
-
-	printf("Got a packet from the tunnel\n");
-
-	bzero(buff, BUFF_SIZE);
-	
-	// 从socket 读数据
-	len = recvfrom(sockfd, buff, BUFF_SIZE, 0, NULL, NULL);
-
-
-	write(tunfd, buff, len);
-
-}
-
-
-void combined_vpn_clinet(int argc, char *argv[])
-{
-
-	int tunfd, sockfd;
-
-	daemon(1, 1); // 守护进程
-
-	tunfd = createTunDevice(); // 建立tun
-	sockfd = connectToUDPServer(argv[1]); // 需要输入VPN服务器ip地址
-
-	// Enter the main loop
-	while (1) {
-		// 监控多个接口
-		fd_set readFDSet;
-
-		FD_ZERO(&readFDSet);
-		FD_SET(sockfd, &readFDSet);
-		FD_SET(tunfd, &readFDSet);
-		select(FD_SETSIZE, &readFDSet, NULL, NULL, NULL);
-
-		if (FD_ISSET(tunfd, &readFDSet)) // tun 中有数据
-		{
-			tunSelected(tunfd, sockfd); // 从tun中取出，传入socket，进入 docker1
-		}
-
-		if (FD_ISSET(sockfd, &readFDSet))// socket 中有数据
-		{
-			socketSelected(tunfd, sockfd); // 从socket 中取出数据，传入tun
-		}
-			
-	}
-
-}
-
-void combind_tls_client(int argc, char *argv[])
-{
-	char *hostname = "yahoo.com";
-	int port = 443;
-
-	if (argc > 1)
-		hostname = argv[1];
-	if (argc > 2)
-		port = atoi(argv[2]);
-
-	/*----------------TLS initialization ----------------*/
-	SSL *ssl = setupTLSClient(hostname);
-
-	/*----------------Create a TCP connection ---------------*/
-	int sockfd = setupTCPClient(hostname, port);
-
-	/*----------------TLS handshake ---------------------*/
-	SSL_set_fd(ssl, sockfd);
-	CHK_NULL(ssl);
-	int err = SSL_connect(ssl);
-
-	CHK_SSL(err);
-	printf("SSL connection is successful\n");
-	printf("SSL connection using %s\n", SSL_get_cipher(ssl));
-
-	/*----------------Send/Receive data --------------------*/
-	char buf[9000];
-	char sendBuf[200];
-
-	sprintf(sendBuf, "GET / HTTP/1.1\nHost: %s\n\n", hostname);
-	SSL_write(ssl, sendBuf, strlen(sendBuf));
-
-	int len;
-
-	do {
-		len = SSL_read(ssl, buf, sizeof(buf) - 1);
-		buf[len] = '\0';
-		printf("%s\n", buf);
-	} while (len > 0);
-
-}
-
 /*
 从tun 中 读出 数据，传入 socket
 */
@@ -296,6 +159,7 @@ void tun_tls_Selected(int tunfd,SSL *ssl)
 	bzero(buff, BUFF_SIZE);
 	
 	len = read(tunfd, buff, BUFF_SIZE);
+	
 
 	SSL_write(ssl, buff, len);
 
@@ -304,8 +168,9 @@ void tun_tls_Selected(int tunfd,SSL *ssl)
 
 /*
 从socket 中 读出 数据，传入 tun
+返回0 表示连接中断
 */
-void socket_tls_Selected(int tunfd, SSL *ssl)
+int socket_tls_Selected(int tunfd, SSL *ssl)
 {
 	int len;
 	char buff[BUFF_SIZE];
@@ -319,42 +184,67 @@ void socket_tls_Selected(int tunfd, SSL *ssl)
 
 	len = SSL_read(ssl, buff, sizeof(buff) - 1);
 
+	if(len == 0)
+		return 0;
+
 	write(tunfd, buff, len);
+
+	return 1;
 
 }
 
 
-
-
-void combind_vpn_tls_client(int argc, char *argv[])
+int combind_vpn_tls_client(int argc, char *argv[])
 {
-	int tunfd, sockfd;
+	int tunfd;
 
-	daemon(1, 1); // 守护进程
+	//daemon(1, 1); // 守护进程
 
 	char *hostname = "yahoo.com";
 	int port = 443;
-
+	int client_num = 1;
 	if (argc > 1)
 		hostname = argv[1];
 	if (argc > 2)
 		port = atoi(argv[2]);
+	if(argc > 3)
+		client_num =atoi(argv[3]) ;
 
 
 	tunfd = createTunDevice(); // 建立tun
+	
+	
+
 
 		/*----------------TLS initialization ----------------*/
 	SSL *ssl = setupTLSClient(hostname);
+
+	// 客户端 tun 配置
+	if(client_num ==1)
+	{
+		system("ifconfig tun0 192.168.53.5/24 up");
+		
+		system("route add -net 192.168.60.0/24 tun0");
+
+	}
+	else if (client_num ==2)
+	{
+		system("ifconfig tun0 192.168.53.6/24 up");
+		
+		system("route add -net 192.168.60.0/24 tun0");
+	}
+	
 
 	/*----------------Create a TCP connection ---------------*/
 	int sockfd = setupTCPClient(hostname, port);
 
 	/*----------------TLS handshake ---------------------*/
 	SSL_set_fd(ssl, sockfd);
+
 	CHK_NULL(ssl);
 	int err = SSL_connect(ssl);
 
-		CHK_SSL(err);
+	CHK_SSL(err);
 	printf("SSL 连接成功\n");
 	printf("SSL 连接使用 %s\n", SSL_get_cipher(ssl));
 
@@ -367,7 +257,27 @@ void combind_vpn_tls_client(int argc, char *argv[])
 		FD_ZERO(&readFDSet);
 		FD_SET(sockfd, &readFDSet);
 		FD_SET(tunfd, &readFDSet);
-		select(FD_SETSIZE, &readFDSet, NULL, NULL, NULL);
+
+		struct timeval timeout;
+		timeout.tv_sec = 5; // 5秒超时
+    	timeout.tv_usec = 0;
+
+		int select_ret = select(FD_SETSIZE, &readFDSet, NULL, NULL, &timeout);
+
+
+		printf("client select_ret: %d\n",select_ret);
+
+		
+		if(select_ret <= 0)
+		{
+		exit_client:
+			SSL_shutdown(ssl);
+			SSL_free(ssl);
+			close(sockfd);
+			printf("客户端进程 退出 \n");
+			exit(0);
+
+		}
 
 		if (FD_ISSET(tunfd, &readFDSet)) // tun 中有数据
 		{
@@ -380,10 +290,13 @@ void combind_vpn_tls_client(int argc, char *argv[])
 		{
 			//socketSelected(tunfd, sockfd); // 从socket 中取出数据，传入tun
 		
-			socket_tls_Selected(tunfd,ssl);
+			if(socket_tls_Selected(tunfd,ssl)== 0) // 表示连接中断
+			{
+				goto exit_client;
+			}
 		
 		}
-			
+
 	}
 
 
@@ -392,5 +305,5 @@ void combind_vpn_tls_client(int argc, char *argv[])
 
 int main(int argc, char *argv[])
 {
-	
+	combind_vpn_tls_client(argc,argv);
 }
