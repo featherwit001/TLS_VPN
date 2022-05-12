@@ -17,7 +17,7 @@
 
 #define PORT_NUMBER 55555 // 服务器打开端口 
 #define BUFF_SIZE 2000   // 缓冲区大小
-
+#define TIMEOUT 100
 struct sockaddr_in peerAddr;
 struct sockaddr_in server_addr;
 
@@ -203,6 +203,7 @@ int combind_vpn_tls_client(int argc, char *argv[])
 	char *hostname = "yahoo.com";
 	int port = 443;
 	int client_num = 1;
+
 	if (argc > 1)
 		hostname = argv[1];
 	if (argc > 2)
@@ -223,15 +224,19 @@ int combind_vpn_tls_client(int argc, char *argv[])
 	if(client_num ==1)
 	{
 		system("ifconfig tun0 192.168.53.5/24 up");
-		
+		printf("ifconfig tun0 192.168.53.5/24 up\n");
+
 		system("route add -net 192.168.60.0/24 tun0");
+		printf("route add -net 192.168.60.0/24 tun0\n");
 
 	}
 	else if (client_num ==2)
 	{
 		system("ifconfig tun0 192.168.53.6/24 up");
-		
+		printf("ifconfig tun0 192.168.53.6/24 up\n");
+
 		system("route add -net 192.168.60.0/24 tun0");
+		printf("route add -net 192.168.60.0/24 tun0\n");
 	}
 	
 
@@ -259,7 +264,7 @@ int combind_vpn_tls_client(int argc, char *argv[])
 		FD_SET(tunfd, &readFDSet);
 
 		struct timeval timeout;
-		timeout.tv_sec = 5; // 5秒超时
+		timeout.tv_sec = TIMEOUT; // 超时
     	timeout.tv_usec = 0;
 
 		int select_ret = select(FD_SETSIZE, &readFDSet, NULL, NULL, &timeout);
@@ -285,7 +290,7 @@ int combind_vpn_tls_client(int argc, char *argv[])
 			tun_tls_Selected(tunfd,ssl);
 
 		}
-
+		
 		if (FD_ISSET(sockfd, &readFDSet))// socket 中有数据
 		{
 			//socketSelected(tunfd, sockfd); // 从socket 中取出数据，传入tun

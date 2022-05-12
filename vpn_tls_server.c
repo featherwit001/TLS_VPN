@@ -13,8 +13,13 @@
 #include <sys/ioctl.h>
 #include <stdlib.h>
 
+#include <sys/types.h>
+#include <sys/stat.h>
+
 #define PORT_NUMBER 55555 // 服务器打开端口 
 #define BUFF_SIZE 2000   // 缓冲区大小
+#define TIMEOUT 100       // 秒
+#define TUNNEL_NUM 5 
 
 struct sockaddr_in peerAddr;
 struct sockaddr_in sa_server;
@@ -27,9 +32,60 @@ struct sockaddr_in sa_server;
 #define KEYF	HOME"server.key"
 #define CACERT	HOME"ca.crt"
 
+#define PIPE   "./pipe/"
+
+
+
 #define CHK_NULL(x)	if ((x)==NULL) exit (1)
 #define CHK_ERR(err,s)	if ((err)==-1) { perror(s); exit(1); }
 #define CHK_SSL(err)	if ((err)==-1) { ERR_print_errors_fp(stderr); exit(2); }
+
+
+typedef struct ipheader {
+    unsigned char iph_ihl:4,  // ip头长度
+                  iph_ver:4;  // ip版本
+    unsigned char iph_tos;    // 服务版本
+    unsigned short int iph_len;  // ip包长度
+    unsigned short int iph_ident;
+    unsigned short int iph_flag:3,
+                       iph_offset:13;
+    unsigned char  iph_ttl;
+    unsigned char  iph_protocol;
+    unsigned short int iph_chksum;
+    struct in_addr iph_sourceip;
+    struct in_addr iph_destip;
+}__attribute__((packed, aligned(4))) ipheader;
+
+
+typedef struct tcpheader {
+    u_short tcp_sport;               /* source port */
+    u_short tcp_dport;               /* destination port */
+    u_int   tcp_seq;                 /* sequence number */
+    u_int   tcp_ack;                 /* acknowledgement number */
+    u_char  tcp_offx2;               /* data offset, rsvd */
+#define TH_OFF(th)      (((th)->tcp_offx2 & 0xf0) >> 4)
+    u_char  tcp_flags;
+#define TH_FIN  0x01
+#define TH_SYN  0x02
+#define TH_RST  0x04
+#define TH_PUSH 0x08
+#define TH_ACK  0x10
+#define TH_URG  0x20
+#define TH_ECE  0x40
+#define TH_CWR  0x80
+#define TH_FLAGS        (TH_FIN|TH_SYN|TH_RST|TH_ACK|TH_URG|TH_ECE|TH_CWR)
+    u_short tcp_win;                 /* window */
+    u_short tcp_sum;                 /* checksum */
+    u_short tcp_urp;                 /* urgent pointer */
+}__attribute__((packed, aligned(4))) tcpheader;
+
+
+typedef struct tunnel_info{
+	struct in_addr iph_destip; // 隧道另一端的 IP 地址
+	u_short tcp_dport;         // 隧道另一端的 TCP 端口    /* destination port */
+	int chilid_pid;    // 负责连接的子进程号
+	char pipefilename[20];  //FIFO
+} tunnel_info ;
 
 
 //建立TUN 设备
@@ -148,7 +204,7 @@ SSL * setupTLSServer()
 }
 
 
-void tun_tls_Selected(int tunfd,SSL *ssl)
+int tun_tls_Selected(int tunfd,SSL *ssl)
 {
 	int len;
 	char buff[BUFF_SIZE];
@@ -158,8 +214,36 @@ void tun_tls_Selected(int tunfd,SSL *ssl)
 	bzero(buff, BUFF_SIZE);
 	
 	len = read(tunfd, buff, BUFF_SIZE);
+	// 判断 tun 中的数据应该发往那一个隧道
+	if(len >0)
+	{
 
+		printf("\ntun packet len:%d\n",len);
+		/*
+		char buff_to_print[BUFF_SIZE];
+		memcpy(buff_to_print,buff,len);
+		buff_to_print[len] = '\0';
+		printf("data from tun: \n%s\n",buff_to_print);
+		*/
+		tunnel_info tunnelinfo;
+		ipheader * iph = (ipheader*)buff;
+		memcpy(&(tunnelinfo.iph_destip), &(iph->iph_destip), sizeof(iph->iph_destip));
+	
+		tcpheader* tcph = (tcpheader*)(buff+sizeof(ipheader));
+		memcpy(&(tunnelinfo.tcp_dport),&(tcph->tcp_dport),sizeof(iph->iph_destip));
+
+		printf("dst ip %s, dsport %d\n",inet_ntoa(tunnelinfo.iph_destip),ntohs(tunnelinfo.tcp_dport));
+
+	}
+	else if(len == 0)
+	{
+
+
+		return 0;
+	}
 	SSL_write(ssl, buff, len);
+
+	return 1;
 
 	//sendto(sockfd, buff, len, 0, (struct sockaddr *) &peerAddr, sizeof(peerAddr));
 }
@@ -181,8 +265,17 @@ int socket_tls_Selected(int tunfd, SSL *ssl)
 
 	len = SSL_read(ssl, buff, sizeof(buff) - 1);
 
-	if(len == 0)
+	if(len >0)
+	{
+
+		printf("\nSSL packet len:%d\n",len);
+
+	}
+	else if(len ==0)
+	{
 		return 0;
+	}
+		
 
 	write(tunfd, buff, len);
 
@@ -195,7 +288,8 @@ int socket_tls_Selected(int tunfd, SSL *ssl)
 int combind_vpn_tls_server(int argc, char *argv[])
 {
 	int tunfd;
-
+	tunnel_info tunnels[TUNNEL_NUM];
+	int tunnel_exist =0; // 存在的隧道数量
 	//daemon(1, 1);// 守护进程
 
 	tunfd = createTunDevice();// 建立tun
@@ -207,22 +301,75 @@ int combind_vpn_tls_server(int argc, char *argv[])
 
 	struct sockaddr_in sa_client;
 	size_t client_len = sizeof(sa_client);
+
 	int listen_sock = setupTCPServer(); // 建立连接使用socket
 
-	fprintf(stderr, "listen_sock = %d\n", listen_sock);
+	fprintf(stderr, "TCP监听中..... listen_sock = %d\n", listen_sock);
 
 
 	while (1) {
 	// 建立连接
 		int sockfd = accept(listen_sock, (struct sockaddr *) &sa_client, &client_len);// 新的socket
-		fprintf(stderr, "sock = %d\n", sockfd);
 		if (sockfd == -1) {
 			//fprintf(stderr, "Accept TCP connect failed! (%d: %s)\n", errno, strerror(errno));
 			printf(" TCP 连接失败 \n");
 			continue;
 		}
 
-		if (fork() == 0) {	// The child process
+		fprintf(stderr, "sock = %d\n", sockfd);
+		// 获取对端信息
+		/*
+		tunnel_exist ++;
+		if(tunnel_exist < TUNNEL_NUM)
+		{
+			struct sockaddr_in *addr = (struct sockaddr_in *)&sa_client;
+			memcpy(&(tunnels[tunnel_exist].iph_destip),&(addr->sin_addr),sizeof(addr->sin_addr));
+			memcpy(&(tunnels[tunnel_exist].tcp_dport),&(addr->sin_port),sizeof(addr->sin_addr));
+			printf("TCP连接成功!\ndst ip %s, dsport %d\n",inet_ntoa(tunnels[tunnel_exist].iph_destip),ntohs(tunnels[tunnel_exist].tcp_dport));
+
+		}
+		else{
+			printf("隧道数量受限！连接失败！\n");
+			continue;
+		}
+		*/
+
+		
+
+
+
+		int pid = fork();
+		
+		if(pid)
+		{
+			close(sockfd); // 关闭建立连接的socket
+			char pid_str[10] ="";
+			//itoa(pid,pid_str,10);
+			sprintf(pid_str,"%d",pid);
+			//printf("-----------pid =%d, pid_str=%s-------------\n",pid,pid_str);
+
+			char *pipefilename = (char *) malloc(strlen(PIPE) + strlen(pid_str)+1);
+			sprintf(pipefilename , "%s%s", PIPE,pid_str);
+			//printf("-----------pipe filename: %s-----------\n",pipefilename);
+
+			tunnels[tunnel_exist].chilid_pid = pid;
+			memcpy(tunnels[tunnel_exist].pipefilename,pipefilename,strlen(pipefilename)+1);
+
+			int mkfifo_res =mkfifo(pipefilename,0666);
+			if (mkfifo_res < 0) {
+        		printf("create fifo failure\n");
+			}
+			else
+			{
+    			printf("create fifo success\n");
+			}
+
+			int pipefd = open(pipefilename, O_WRONLY );
+			char hello[] = "hello, my child\n";
+			write(pipefd,hello,strlen(hello));
+
+		}
+		else if (pid == 0) {	// The child process
 			close(listen_sock);// 关闭监听的socket
 
 			SSL_set_fd(ssl, sockfd);
@@ -232,7 +379,26 @@ int combind_vpn_tls_server(int argc, char *argv[])
 			CHK_SSL(err);
 			printf("SSL connection established!\n");
 			
+			// 进程信息和管道信息
+			char pid_str[10] ="";
+			//itoa(pid,pid_str,10);
+			pid = getpid();
+			sprintf(pid_str,"%d",pid);
+			//printf("-----------child pid =%d, pid_str=%s-------------\n",pid,pid_str);
 
+			char *pipefilename = (char *) malloc(strlen(PIPE) + strlen(pid_str)+1);
+			sprintf(pipefilename , "%s%s", PIPE,pid_str);
+			//printf("-----------child pipe filename: %s-----------\n",pipefilename);
+
+			tunnels[tunnel_exist].chilid_pid = pid;	
+			memcpy(tunnels[tunnel_exist].pipefilename,pipefilename,strlen(pipefilename)+1);
+			
+			// FIFO 读测试
+			char buf[30];
+			int pipefd = open(pipefilename, O_RDONLY);
+    		int len = read(pipefd, buf, sizeof(buf));
+    		write(STDOUT_FILENO, buf, len);
+			
 			while (1) {
 				fd_set readFDSet;
 
@@ -241,7 +407,7 @@ int combind_vpn_tls_server(int argc, char *argv[])
 				FD_SET(tunfd, &readFDSet);
 
 				struct timeval timeout;
-				timeout.tv_sec = 5; // 5秒超时
+				timeout.tv_sec = TIMEOUT; // 5秒超时
     			timeout.tv_usec = 0;
 
 				int select_ret = select(FD_SETSIZE, &readFDSet, NULL, NULL, &timeout);
@@ -254,6 +420,18 @@ int combind_vpn_tls_server(int argc, char *argv[])
 					SSL_shutdown(ssl);
 					SSL_free(ssl);
 					close(sockfd);
+
+					int del_fifo = unlink(tunnels[tunnel_exist].pipefilename); // 关闭有名管道
+					// 判断是否成功删除管道
+					if (del_fifo == -1)
+					{
+						printf("unlink %s failed\n", tunnels[tunnel_exist].pipefilename);
+						return -1;
+					}
+					else
+					{
+						printf("unlink %s success\n", tunnels[tunnel_exist].pipefilename);
+					}
 					printf("连接 子进程 退出 \n");
 					exit(0);
 
@@ -261,6 +439,7 @@ int combind_vpn_tls_server(int argc, char *argv[])
 
 				if (FD_ISSET(tunfd, &readFDSet)) // tun 中有数据
 				{
+					// need to change
 					tun_tls_Selected(tunfd, ssl); // 从tun中取出，传入socket，进入 docker1
 				}
 
@@ -270,19 +449,17 @@ int combind_vpn_tls_server(int argc, char *argv[])
 					{
 						goto exit_server_cproc;
 					}
-		
+					
 					 // 从socket 中取出数据，传入tun
 				}
 				
 			}
 			
 
-		} else {	// The parent process
-			close(sockfd); // 关闭建立连接的socket
 		}
-
 	}
-
+	
+	return 0;
 
 }
 
