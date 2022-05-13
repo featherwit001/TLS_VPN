@@ -4,6 +4,9 @@
         "features.h": "c",
         "in.h": "c",
         "time64.h": "c",
-        "typeinfo": "c"
+        "typeinfo": "c",
+        "pthread.h": "c",
+        "err.h": "c",
+        "ssl.h": "c"
     }
 }

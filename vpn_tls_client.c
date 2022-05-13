@@ -220,6 +220,10 @@ int combind_vpn_tls_client(int argc, char *argv[])
 		/*----------------TLS initialization ----------------*/
 	SSL *ssl = setupTLSClient(hostname);
 
+	
+
+
+
 	// 客户端 tun 配置
 	if(client_num ==1)
 	{
@@ -242,6 +246,9 @@ int combind_vpn_tls_client(int argc, char *argv[])
 
 	/*----------------Create a TCP connection ---------------*/
 	int sockfd = setupTCPClient(hostname, port);
+
+
+	
 
 	/*----------------TLS handshake ---------------------*/
 	SSL_set_fd(ssl, sockfd);
