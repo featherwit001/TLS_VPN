@@ -25,18 +25,18 @@
 #define BUFF_SIZE 2000   // 缓冲区大小
 #define TIMEOUT 100       // 秒
 #define TUNNEL_NUM 5 
-
+#define LOGIN_LEN  20
 struct sockaddr_in peerAddr;
 struct sockaddr_in sa_server;
 int tunfd;// tun 文件描述符
 //int pipeTgetP; // 子线程获得子进程信息
 /* define HOME to be dir for key and cert files... */
-#define HOME	"./cert_server/"
+#define HOME	"./myCA/"
 
 /* Make these what you want for cert & key files */
-#define CERTF	HOME"server.crt"
-#define KEYF	HOME"server.key"
-#define CACERT	HOME"ca.crt"
+#define CERTF	HOME"wangyx_server_cert.pem"
+#define KEYF	HOME"wangyx_server_key.pem"
+#define CACERT	HOME"ca_cert.pem"
 
 #define GlobalPIPE "./pipe/P2T" // childproc to pipe 
 #define PIPE   "./pipe/"
@@ -115,6 +115,11 @@ typedef struct infoP2T{
 }infoP2T;
 
 
+typedef struct login_info{
+	char user[LOGIN_LEN];
+	char passwd[LOGIN_LEN];
+	char pass;
+}login_info;
 
 
 //建立TUN 设备
@@ -194,7 +199,7 @@ SSL * setupTLSServer()
 	SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
 	//SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
 
-	// 加载服务器 证书
+	// 加载ca 证书
 	SSL_CTX_load_verify_locations(ctx, CACERT, NULL);
 
 	// Step 2: Set up the server certificate and private key
@@ -521,17 +526,50 @@ void* tunnel_info_patch(void *TUNNELS)
 					}
 					else if(info.func == 2 )
 					{
-						close(tunnels->tunnel_infos[i].pipefd); // 关闭pipefd
+						printf("隧道关闭\n");
+						close(tunnels->tunnel_infos[i].pipefd); //  关闭 主进程 pipefd
+						int del_fifo = unlink(tunnels->tunnel_infos[i].pipefilename); // 关闭有名管道
+						// 判断是否成功删除管道
+						if (del_fifo == -1)
+						{
+							printf("\nunlink %s failed\n",tunnels->tunnel_infos[i].pipefilename);
+						}
+						else
+						{
+							printf("\nunlink %s success\n", tunnels->tunnel_infos[i].pipefilename);
+						}
+						
+						
+						if(tunnels->tunnel_infos[i].info_seted ==1)
+						{
+							pthread_mutex_lock(&g_mutex_lock);
+							tunnels->tunnel_num--; // 隧道销毁
+							pthread_mutex_unlock(&g_mutex_lock);
+						}
+						
 						memset(&(tunnels->tunnel_infos[i]),0,sizeof(tunnels->tunnel_infos[i])); //清空隧道信息
 
-						pthread_mutex_lock(&g_mutex_lock);
-						tunnels->tunnel_num--; // 隧道销毁
-						pthread_mutex_unlock(&g_mutex_lock);
+						
+						
 
 					}
 					else if(info.func == 3)
 					{
+						printf("登陆失败，隧道取消\n");
+						close(tunnels->tunnel_infos[i].pipefd); // 关闭 主进程 pipefd
+						int del_fifo = unlink(tunnels->tunnel_infos[i].pipefilename); // 关闭有名管道
+							// 判断是否成功删除管道
+						if (del_fifo == -1)
+						{
+							printf("\nunlink %s failed\n", tunnels->tunnel_infos[i].pipefilename);
+						}
+						else
+						{
+							printf("\nunlink %s success\n",tunnels->tunnel_infos[i].pipefilename);
+						}
 						
+						memset(&(tunnels->tunnel_infos[i]),0,sizeof(tunnels->tunnel_infos[i])); //清空隧道信息
+
 					}
 					
 				}
@@ -542,12 +580,48 @@ void* tunnel_info_patch(void *TUNNELS)
 	return NULL;
 }
 
+
+int login(char *user, char *passwd)
+{
+	struct spwd *pw;
+	char *epasswd;
+	pw = getspnam(user);
+	if (pw == NULL) {
+		return -1;
+	}
+	printf("Login name: %s\n", pw->sp_namp);
+	printf("Passwd : %s\n", pw->sp_pwdp);
+
+	epasswd = crypt(passwd, pw->sp_pwdp);
+	printf("epasswd : %s\n",epasswd);
+	if (strcmp(epasswd, pw->sp_pwdp)) {
+		return -1;
+	}
+	return 1;
+}
+
+
 int check_id(int sockfd)
 {
+	login_info loginfo;
+	memset(&loginfo,0,sizeof(loginfo));
+	int len  = read(sockfd,&loginfo,sizeof(loginfo));
+	printf("客户端登陆 用户名:%s 密码:%s\n",loginfo.user,loginfo.passwd);
 
-	//int len  = read(sockfd,);
+	if(login(loginfo.user,loginfo.passwd) == 1)
+	{
+		printf("客户端登陆成功\n");
+		loginfo.pass =1;
+		write(sockfd,&loginfo,sizeof(loginfo)); //通知客户端写回
+		return 1;
+	}
+	else
+	{ // 验证失败
+		loginfo.pass =0;
+		write(sockfd,&loginfo,sizeof(loginfo)); //通知客户端写回
+		return 0;
+	}
 
-	return 1;
 } 
 
 
@@ -661,23 +735,31 @@ int combind_vpn_tls_server(int argc, char *argv[])
 
 			close(listen_sock);// 关闭监听的socket
 			
+
+			// 进程信息和管道信息
+			char pid_str[10] ="";
+			pid = getpid();
+			sprintf(pid_str,"%d",pid);
+			char *pipefilename = (char *) malloc(strlen(PIPE) + strlen(pid_str)+1);
+			sprintf(pipefilename , "%s%s", PIPE,pid_str);
+
+
+			//登陆验证
 			if(check_id(sockfd) == 0) // 验证失败退出
 			{
-				// 销毁隧道记录
-					infoP2T tunnelinfo;
-					tunnelinfo.chilid_pid = getpid();
-					tunnelinfo.func = 3;
 
-					int pipeP2T = open(GlobalPIPE, O_WRONLY );
-					write(pipeP2T,&tunnelinfo,sizeof(tunnelinfo)); // 传给隧道信息管理线程
-					close(pipeP2T); // 关闭写入口
+				// 销毁隧道记录
+				infoP2T tunnelinfo;
+				tunnelinfo.chilid_pid = getpid();
+				tunnelinfo.func = 3;
+
+				int pipeP2T = open(GlobalPIPE, O_WRONLY );
+				write(pipeP2T,&tunnelinfo,sizeof(tunnelinfo)); // 传给隧道信息管理线程
+				close(pipeP2T); // 关闭写入口
 
 				exit(0);
 			}
 				
-
-
-
 
 			SSL_set_fd(ssl, sockfd);
 			int err = SSL_accept(ssl);
@@ -687,12 +769,7 @@ int combind_vpn_tls_server(int argc, char *argv[])
 			printf("\nSSL connection established!\n");
 			
 
-			// 进程信息和管道信息
-			char pid_str[10] ="";
-			pid = getpid();
-			sprintf(pid_str,"%d",pid);
-			char *pipefilename = (char *) malloc(strlen(PIPE) + strlen(pid_str)+1);
-			sprintf(pipefilename , "%s%s", PIPE,pid_str);
+			
 			
 			char buf[30];
 			int pipefd = open(pipefilename, O_RDONLY);
@@ -719,19 +796,6 @@ int combind_vpn_tls_server(int argc, char *argv[])
 					SSL_free(ssl);
 					close(sockfd);
 					close(pipefd);
-					
-					int del_fifo = unlink(pipefilename); // 关闭有名管道
-					// 判断是否成功删除管道
-					if (del_fifo == -1)
-					{
-						printf("\nunlink %s failed\n", pipefilename);
-						return -1;
-					}
-					else
-					{
-						printf("\nunlink %s success\n", pipefilename);
-					}
-
 					// 销毁隧道记录
 					infoP2T tunnelinfo;
 					tunnelinfo.chilid_pid = getpid();
@@ -740,7 +804,6 @@ int combind_vpn_tls_server(int argc, char *argv[])
 					int pipeP2T = open(GlobalPIPE, O_WRONLY );
 					write(pipeP2T,&tunnelinfo,sizeof(tunnelinfo)); // 传给隧道信息管理线程
 					close(pipeP2T); // 关闭写入口
-
 
 					printf("\n服务器连接子进程 %d退出 \n",pid);
 					exit(0);

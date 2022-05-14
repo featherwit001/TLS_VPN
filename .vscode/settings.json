@@ -7,6 +7,7 @@
         "typeinfo": "c",
         "pthread.h": "c",
         "err.h": "c",
-        "ssl.h": "c"
+        "ssl.h": "c",
+        "shadow.h": "c"
     }
 }

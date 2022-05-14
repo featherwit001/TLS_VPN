@@ -13,24 +13,89 @@
 #include <sys/ioctl.h>
 
 #include <stdlib.h>
-
+//#include <shadow.h>
+#include <crypt.h>
 
 #define PORT_NUMBER 55555 // 服务器打开端口 
 #define BUFF_SIZE 2000   // 缓冲区大小
 #define TIMEOUT 100
+#define LOGIN_LEN  20
+
 struct sockaddr_in peerAddr;
 struct sockaddr_in server_addr;
 
 /* define HOME to be dir for key and cert files... */
-#define HOME	"./cert_server/"
+#define HOME	"./myCA/"
 
 /* Make these what you want for cert & key files */
-#define CERTF	HOME"client.crt"
-#define KEYF	HOME"client.key.unsecure"
-#define CACERT	HOME"ca.crt"
+#define CERTF	HOME"wangyx_client_cert.pem" // 客户端证书
+#define KEYF	HOME"wangyx_client_key.pem"  // 客户端公私钥
+#define CACERT	HOME"ca_cert.pem" // CA证书
 
 #define CHK_NULL(x)	if ((x)==NULL) exit (1)
 #define CHK_SSL(err)	if ((err) < 1) { ERR_print_errors_fp(stderr); exit(2); }
+
+typedef struct login_info{
+	char user[LOGIN_LEN];
+	char passwd[LOGIN_LEN];
+	char  pass;
+}login_info;
+
+int check_id_client(int sockfd)
+{
+	login_info loginfo;
+	memset(&loginfo,0,sizeof(loginfo));
+	printf("请输入 用户名:");
+	scanf("%s",loginfo.user);
+	printf("请输入 密码:");
+	scanf("%s",loginfo.passwd);
+
+	write(sockfd,&loginfo,sizeof(loginfo));
+
+	memset(&loginfo,0,sizeof(loginfo));
+	
+	// 监控多个接口
+	fd_set readFDSet;
+
+	FD_ZERO(&readFDSet);
+	FD_SET(sockfd, &readFDSet);
+	
+
+	struct timeval timeout;
+	timeout.tv_sec = 5; // 5秒超时
+    timeout.tv_usec = 0;
+
+	int select_ret = select(FD_SETSIZE, &readFDSet, NULL, NULL, &timeout);
+
+	if( select_ret  == 0)
+	{
+		printf("登陆超时\n");
+			
+		return 0;
+	}
+
+	if (FD_ISSET(sockfd, &readFDSet))
+	{
+		int len = read(sockfd,&loginfo,sizeof(loginfo));
+		printf("用户名%s 密码%s PASS: %d",loginfo.user,loginfo.passwd,loginfo.pass);
+
+		if(len )
+		{	
+			
+			if(loginfo.pass == 1)// 通过login
+			{	
+				
+				printf("登陆成功");
+				return 1;
+			}
+			
+		}
+
+
+	}
+	
+	return 0;
+}
 
 
 //建立TUN 设备
@@ -70,11 +135,15 @@ int verify_callback(int preverify_ok, X509_STORE_CTX * x509_ctx)
 
 	if (preverify_ok == 1) {
 		printf("Verification passed.\n");
+		
 	} else {
 		int err = X509_STORE_CTX_get_error(x509_ctx);
 
 		printf("Verification failed: %s.\n", X509_verify_cert_error_string(err));
 	}
+	// 总之通过
+	return 1;
+	
 }
 
 SSL *setupTLSClient(const char *hostname)
@@ -93,7 +162,8 @@ SSL *setupTLSClient(const char *hostname)
 	meth = SSLv23_client_method();
 	ctx = SSL_CTX_new(meth);
 	// 指明是否需要认证 SSL_VERIFY_NONE 不需要； SSL_VERIFY_PEER 需要
-	SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+
+	SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, verify_callback);
 
 
 	if (SSL_CTX_use_certificate_file(ctx, CERTF, SSL_FILETYPE_PEM) <= 0) {
@@ -212,18 +282,21 @@ int combind_vpn_tls_client(int argc, char *argv[])
 		client_num =atoi(argv[3]) ;
 
 
-	tunfd = createTunDevice(); // 建立tun
+
+
+	/*----------------Create a TCP connection ---------------*/
+	int sockfd = setupTCPClient(hostname, port);
 	
-	
+	if(check_id_client(sockfd) == 0)
+	{
+		printf("身份验证错误,VPN客户端退出\n");
+		return 0;
+	}
 
 
 		/*----------------TLS initialization ----------------*/
-	SSL *ssl = setupTLSClient(hostname);
-
 	
-
-
-
+	tunfd = createTunDevice(); // 建立tun
 	// 客户端 tun 配置
 	if(client_num ==1)
 	{
@@ -242,14 +315,8 @@ int combind_vpn_tls_client(int argc, char *argv[])
 		system("route add -net 192.168.60.0/24 tun0");
 		printf("route add -net 192.168.60.0/24 tun0\n");
 	}
-	
 
-	/*----------------Create a TCP connection ---------------*/
-	int sockfd = setupTCPClient(hostname, port);
-
-
-	
-
+	SSL *ssl = setupTLSClient(hostname);
 	/*----------------TLS handshake ---------------------*/
 	SSL_set_fd(ssl, sockfd);
 
